@@ -1,0 +1,85 @@
+{
+  "name": "Stem & Tafel - Vapi Supabase Tools",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-server",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "0f756e5d-bce5-4faa-bfd6-f18dcf2e2702",
+      "name": "Vapi Server URL",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -620,
+        0
+      ],
+      "webhookId": "stem-tafel-vapi-server"
+    },
+    {
+      "parameters": {
+        "jsCode": "const request = $input.first().json;\nconst headers = request.headers || {};\nconst secret = $vars.VAPI_WEBHOOK_SECRET;\nif (!secret) throw new Error('Set the VAPI_WEBHOOK_SECRET n8n variable before activating this workflow.');\nconst authorization = headers.authorization || headers.Authorization || '';\nif (authorization !== `Bearer ${secret}`) return [{ json: { statusCode: 401, response: { error: 'Unauthorized' } } }];\nconst input = request.body || request;\nconst message = input.message || input;\nconst call = message.call || {};\nconst callId = String(call.id || message.callId || '');\nconst phone = String((call.customer && call.customer.number) || (message.customer && message.customer.number) || 'Unknown caller');\nconst supabaseUrl = String($vars.SUPABASE_URL || '').replace(/\\/$/, '');\nconst supabaseKey = $vars.SUPABASE_SERVICE_ROLE_KEY;\nif (!supabaseUrl || !supabaseKey) throw new Error('Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in n8n variables.');\nconst apiHeaders = { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}`, 'Content-Type': 'application/json' };\nasync function db(path, method = 'GET', body, prefer) {\n  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, { method, headers: { ...apiHeaders, ...(prefer ? { Prefer: prefer } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });\n  const text = await response.text();\n  if (!response.ok) throw new Error(`Supabase ${response.status}: ${text}`);\n  return text ? JSON.parse(text) : null;\n}\nasync function saveCall(values) {\n  if (!callId) return;\n  await db('calls?on_conflict=call_id', 'POST', { call_id: callId, phone, ...values }, 'resolution=merge-duplicates,return=minimal');\n}\nfunction result(toolCallId, value) {\n  return { toolCallId, result: JSON.stringify(value) };\n}\nconst type = message.type || '';\nif (type === 'status-update' && ['ringing', 'in-progress'].includes(message.status)) {\n  await saveCall({});\n  return [{ json: { response: { received: true } } }];\n}\nif (type === 'end-of-call-report') {\n  const artifact = message.artifact || call.artifact || {};\n  const started = Date.parse(call.startedAt || '');\n  const ended = Date.parse(call.endedAt || '');\n  const duration = Number.isFinite(started) && Number.isFinite(ended) ? Math.max(0, Math.round((ended - started) / 1000)) : null;\n  await saveCall({ duration_s: duration, summary: message.analysis?.summary || message.summary || null, transcript: artifact.transcript || message.transcript || null, recording_url: artifact.recordingUrl || call.recordingUrl || null });\n  return [{ json: { response: { received: true } } }];\n}\nif (type !== 'tool-calls') return [{ json: { response: { received: true } } }];\nif (!callId) throw new Error('Vapi tool call did not include a call ID.');\nawait saveCall({});\nconst toolCalls = message.toolCallList || message.toolWithToolCallList || [];\nconst results = [];\nfor (const entry of toolCalls) {\n  const tool = entry.toolCall || entry;\n  const functionCall = tool.function || {};\n  const toolCallId = String(tool.id || entry.id || '');\n  const name = String(functionCall.name || entry.name || tool.name || '');\n  let args = functionCall.arguments || functionCall.parameters || tool.parameters || tool.arguments || {};\n  if (typeof args === 'string') args = JSON.parse(args);\n  try {\n    if (name === 'get_menu') {\n      const menu = await db('menu_items?available=eq.true&select=name,description,price,category&order=category,name');\n      results.push(result(toolCallId, { items: menu || [] }));\n    } else if (name === 'save_order') {\n      if (args.confirmed !== true) throw new Error('The caller must explicitly confirm the complete order before it can be saved.');\n      const type = args.type;\n      if (!['pickup', 'delivery'].includes(type)) throw new Error('Order type must be pickup or delivery.');\n      const address = String(args.address || '').trim();\n      if (type === 'delivery' && address.length < 8) throw new Error('A complete delivery address is required.');\n      const items = Array.isArray(args.items) ? args.items : [];\n      if (!items.length) throw new Error('At least one order item is required.');\n      const existing = await db(`orders?call_id=eq.${encodeURIComponent(callId)}&select=id&limit=1`);\n      if (existing && existing.length) { results.push(result(toolCallId, { success: true, already_saved: true, message: 'An order is already saved for this call.' })); continue; }\n      const menu = await db('menu_items?available=eq.true&select=name,price');\n      const lines = items.map((line) => {\n        const item = menu.find((row) => row.name.toLocaleLowerCase('en-US') === String(line.name || '').trim().toLocaleLowerCase('en-US'));\n        const quantity = Number(line.quantity);\n        if (!item || !Number.isInteger(quantity) || quantity < 1 || quantity > 50) throw new Error('Order includes an unavailable menu item or invalid quantity.');\n        const unit = Number(item.price);\n        return { name: item.name, quantity, unit_price: unit, line_total: Math.round(unit * quantity * 100) / 100 };\n      });\n      const total = Math.round(lines.reduce((sum, line) => sum + line.line_total, 0) * 100) / 100;\n      const confirmedTotal = Number(args.confirmed_total);\n      if (!Number.isFinite(confirmedTotal) || Math.abs(confirmedTotal - total) > 0.01) throw new Error('The confirmed total does not match the current menu prices. Read back the correct total and ask for confirmation again.');\n      const eta = type === 'delivery' ? 45 : 20;\n      await db('orders', 'POST', { call_id: callId, customer_name: String(args.customer_name || '').trim() || null, phone: String(args.phone || phone), type, address: type === 'delivery' ? address : null, items: lines, total, eta_minutes: eta, status: 'new', notes: String(args.notes || '').trim() || null }, 'return=representation');\n      results.push(result(toolCallId, { success: true, total, eta_minutes: eta, message: `Order saved. Total ${total.toFixed(2)} euros; estimated ${eta} minutes.` }));\n    } else if (name === 'save_booking') {\n      if (args.confirmed !== true) throw new Error('The caller must explicitly confirm the complete reservation before it can be saved.');\n      const customerName = String(args.customer_name || '').trim();\n      const date = String(args.date || '');\n      const time = String(args.time || '');\n      const partySize = Number(args.party_size);\n      if (!customerName || !/^\\d{4}-\\d{2}-\\d{2}$/.test(date) || !/^\\d{2}:\\d{2}$/.test(time) || !Number.isInteger(partySize) || partySize < 1 || partySize > 30) throw new Error('Reservation details are missing or invalid.');\n      const existing = await db(`bookings?call_id=eq.${encodeURIComponent(callId)}&select=id&limit=1`);\n      if (existing && existing.length) { results.push(result(toolCallId, { success: true, already_saved: true, message: 'A reservation is already saved for this call.' })); continue; }\n      await db('bookings', 'POST', { call_id: callId, customer_name: customerName, phone: String(args.phone || phone), date, time, party_size: partySize, notes: String(args.notes || '').trim() || null, status: 'confirmed' }, 'return=representation');\n      results.push(result(toolCallId, { success: true, message: `Reservation saved for ${date} at ${time} for ${partySize} people.` }));\n    } else {\n      results.push(result(toolCallId, { success: false, error: `Unknown Vapi tool: ${name}` }));\n    }\n  } catch (error) {\n    results.push({ toolCallId, error: error instanceof Error ? error.message : 'The request failed.' });\n  }\n}\nreturn [{ json: { response: { results } } }];"
+      },
+      "id": "de481310-6592-4702-89ea-9c07a51bf33f",
+      "name": "Handle Vapi events and tools",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode || 200 }}"
+        }
+      },
+      "id": "ac7cc9bc-5611-4a3a-adfd-4e1273626cbf",
+      "name": "Respond to Vapi",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -100,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Vapi Server URL": {
+      "main": [
+        [
+          {
+            "node": "Handle Vapi events and tools",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Vapi events and tools": {
+      "main": [
+        [
+          {
+            "node": "Respond to Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "73c414d6-ff26-4e5d-8e43-77352a280046",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
